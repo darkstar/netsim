@@ -23,7 +23,7 @@ You might also want to download the following archive which contains the larger 
 * a few sample disk files, currently I only have one with Ultrix 4.0 for VAX installed. (note that this is probably also (c) DEC)
 * A Cisco IOS image for your favorite router (I use the C3640 with the c3640-js-m.124-3g image). This is definitely (c) Cisco
 
-You can download the archive here (TODO: provide URL)
+You can download the archive here: http://goo.gl/do4yUn (~70 mb, uncompresses to a few hundred mb in sparse files)
 
 ## Usage
 
