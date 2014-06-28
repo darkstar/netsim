@@ -1,0 +1,478 @@
+#!/bin/bash
+
+#
+# lxc: linux Container library
+
+# Authors:
+# Michael Drueing <michael@drueing.de>
+
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+
+# Detect use under userns (unsupported)
+for arg in "$@"; do
+    [ "$arg" = "--" ] && break
+    if [ "$arg" = "--mapped-uid" -o "$arg" = "--mapped-gid" ]; then
+        echo "This template can't be used for unprivileged containers." 1>&2
+        echo "You may want to try the \"download\" template instead." 1>&2
+        exit 1
+    fi
+done
+
+# Make sure the usual locations are in PATH
+export PATH=$PATH:/usr/sbin:/usr/bin:/sbin:/bin
+
+# an arrayholding all the ethernet config
+declare -a ethers
+declare -a serials
+numethers=0
+numserials=0
+
+install_dynamips()
+{
+    rootfs=$1
+    name=$2
+    res=0
+    tree="\
+$rootfs/selinux \
+$rootfs/dev \
+$rootfs/home \
+$rootfs/root \
+$rootfs/etc \
+$rootfs/etc/init.d \
+$rootfs/cisco \
+$rootfs/bin \
+$rootfs/usr/bin \
+$rootfs/sbin \
+$rootfs/usr/sbin \
+$rootfs/proc \
+$rootfs/sys \
+$rootfs/mnt \
+$rootfs/tmp \
+$rootfs/var/log \
+$rootfs/usr/share/udhcpc \
+$rootfs/dev/pts \
+$rootfs/dev/shm \
+$rootfs/lib \
+$rootfs/usr/lib \
+$rootfs/lib64 \
+$rootfs/usr/lib64"
+
+    mkdir -p $tree || return 1
+    chmod 755 $tree || return 1
+
+    pushd $rootfs/dev > /dev/null || return 1
+
+    # minimal devices needed for busybox
+    mknod -m 666 tty c 5 0       || res=1
+    mknod -m 666 console c 5 1   || res=1
+    mknod -m 666 tty0 c 4 0      || res=1
+    mknod -m 666 tty1 c 4 0      || res=1
+    mknod -m 666 tty5 c 4 0      || res=1
+    mknod -m 600 ram0 b 1 0      || res=1
+    mknod -m 666 null c 1 3      || res=1
+    mknod -m 666 zero c 1 5      || res=1
+    mknod -m 666 urandom c 1 9   || res=1
+
+    popd > /dev/null
+
+    # root user defined
+    cat <<EOF >> $rootfs/etc/passwd
+root:x:0:0:root:/root:/bin/sh
+EOF
+
+    cat <<EOF >> $rootfs/etc/group
+root:x:0:root
+EOF
+
+    # mount everything
+    cat <<EOF >> $rootfs/etc/init.d/rcS
+#!/bin/sh
+/bin/syslogd
+/bin/mount -a
+EOF
+
+    # executable
+    chmod 744 $rootfs/etc/init.d/rcS || return 1
+
+    # mount points
+    cat <<EOF >> $rootfs/etc/fstab
+shm   /dev/shm   tmpfs   defaults     0      0
+EOF
+
+    # writable and readable for other
+    chmod 644 $rootfs/etc/fstab || return 1
+
+    # prepare dynamips launch file
+    macaddr=$(printf '00:00:c0:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+    netattach=""
+    for ((eth=0; eth < $numethers; eth++)) do
+        ethc=${ethers[$eth]}
+        slot=$(echo $ethc | awk -F: '{ print $1; }')
+        port=$(echo $ethc | awk -F: '{ print $2; }')
+        intf=$(echo $ethc | awk -F: '{ print $3; }')
+        netattach="${netattach} -s ${slot}:${port}:linux_eth:${intf} "
+    done
+    for ((ser=0; ser < $numserials; ser++)) do
+        serc=${serials[$ser]}
+        slot=$(echo $serc | awk -F: '{ print $1; }')
+        port=$(echo $serc | awk -F: '{ print $2; }')
+        intf=$(echo $serc | awk -F: '{ print $3; }')
+        netattach="${netattach} -s ${slot}:${port}:linux_eth:${intf} "
+    done
+
+    idleparam=""
+    if [ -n "${ios_idlepc}" ]; then
+        idleparam=" --idle-pc ${ios_idlepc}"
+    fi
+
+    cmdline="/cisco/dynamips -r ${ios_memory} -P ${ios_model} -C /cisco/baseconfig.cfg ${ios_params} ${netattach} -m ${macaddr} ${idleparam} /cisco/${ios_image}"
+    cat <<EOF >> $rootfs/cisco/run-dynamips.sh
+#!/bin/sh
+/bin/echo Starting DynaMIPS...
+echo Running ${cmdline}
+sleep 2
+cd /cisco
+${cmdline}
+/bin/echo respawning...
+EOF
+    chmod 744 $rootfs/cisco/run-dynamips.sh
+
+    # launch rcS first then make a console available
+    # and propose a shell on the tty, the last one is
+    # not needed
+    cat <<EOF >> $rootfs/etc/inittab
+::sysinit:/etc/init.d/rcS
+console::respawn:/cisco/run-dynamips.sh
+EOF
+    # writable and readable for other
+    chmod 644 $rootfs/etc/inittab || return 1
+
+    return $res
+}
+
+configure_dynamips()
+{
+    rootfs=$1
+
+    which dynamips >/dev/null 2>&1
+
+    if [ $? -ne 0 ]; then
+        echo "dynamips executable is not accessible"
+        return 1
+    fi
+
+    # copy dynamips in the rootfs
+    cp $(which busybox) $rootfs/bin
+    cp $(which dynamips) $rootfs/cisco
+    if [ $? -ne 0 ]; then
+        echo "failed to copy busybox+dynamips in the rootfs"
+        return 1
+    fi
+
+    # copy the IOS image to the rootfs
+    iosfile="${basepath}/ios/images/${ios_image}"
+    if [ ! -f "${iosfile}" ]; then
+        echo "could not find the IOS image ${iosfile}, check your config"
+        return 1
+    fi
+    cp ${iosfile} $rootfs/cisco
+
+    # symlink busybox for the commands it supports
+    # it would be nice to just use "chroot $rootfs busybox --install -s /bin"
+    # but that only works right in a chroot with busybox >= 1.19.0
+    pushd $rootfs/bin > /dev/null || return 1
+    ./busybox --help | grep 'Currently defined functions:' -A300 | \
+      grep -v 'Currently defined functions:' | tr , '\n' | \
+      xargs -n1 ln -s busybox
+    popd > /dev/null
+
+    # relink /sbin/init
+    ln $rootfs/bin/busybox $rootfs/sbin/init
+
+    # passwd exec must be setuid
+    chmod +s $rootfs/bin/passwd
+    touch $rootfs/etc/shadow
+
+    # setting passwd for root
+    CHPASSWD_FILE=$rootfs/root/chpasswd.sh
+
+    cat <<EOF >$CHPASSWD_FILE
+echo "setting root password to \"root\""
+
+mount -n --bind /lib $rootfs/lib
+if [ \$? -ne 0 ]; then
+    echo "Failed bind-mounting /lib at $rootfs/lib"
+    exit 1
+fi
+
+chroot $rootfs chpasswd <<EOFF 2>/dev/null
+root:root
+EOFF
+
+
+if [ \$? -ne 0 ]; then
+    echo "Failed to change root password"
+    exit 1
+fi
+
+umount $rootfs/lib
+
+EOF
+
+    lxc-unshare -s MOUNT -- /bin/sh < $CHPASSWD_FILE
+    rm $CHPASSWD_FILE
+
+    return 0
+}
+
+copy_configuration()
+{
+    path=$1
+    rootfs=$2
+    name=$3
+
+grep -q "^lxc.rootfs" $path/config 2>/dev/null || echo "lxc.rootfs = $rootfs" >> $path/config
+cat <<EOF >> $path/config
+lxc.haltsignal = SIGUSR1
+lxc.utsname = $name
+lxc.tty = 1
+lxc.pts = 1
+lxc.cap.drop = sys_module mac_admin mac_override sys_time
+
+# When using LXC with apparmor, uncomment the next line to run unconfined:
+#lxc.aa_profile = unconfined
+EOF
+
+    libdirs="\
+        lib \
+        usr/lib \
+        lib64 \
+        usr/lib64"
+
+    for dir in $libdirs; do
+        if [ -d "/$dir" ] && [ -d "$rootfs/$dir" ]; then
+            echo "lxc.mount.entry = /$dir $dir none ro,bind 0 0" >> $path/config
+        fi
+    done
+    #echo "lxc.mount.entry = /sys/kernel/security sys/kernel/security none ro,bind,optional 0 0" >>$path/config
+    echo "lxc.mount.auto = proc:mixed sys" >>$path/config
+
+    # do network configuration
+    # first remove "default" network stuff from config
+    cat $path/config | grep -v 'lxc.network.' > $path/config.new
+    mv $path/config.new $path/config
+
+    for ((eth=0; eth < $numethers; eth++)) do
+        ethc=${ethers[$eth]}
+        slot=$(echo $ethc | awk -F: '{ print $1; }')
+        port=$(echo $ethc | awk -F: '{ print $2; }')
+        intf=$(echo $ethc | awk -F: '{ print $3; }')
+        brdg=$(echo $ethc | awk -F: '{ print $4; }')
+        if [ -z "$slot" -o -z "$port" -o -z "$intf" -o -z "$brdg" ]; then
+            echo "Invalid network config: $ethc"
+            return 1
+        fi
+        echo "lxc.network.type = veth"  >>$path/config
+        echo "lxc.network.name = $intf" >>$path/config
+        echo "lxc.network.link = $brdg" >>$path/config
+        echo "lxc.network.flags = up"   >>$path/config
+        echo ""                         >>$path/config        
+    done
+
+    for ((ser=0; ser < $numserials; ser++)) do
+        serc=${serials[$ser]}
+        slot=$(echo $serc | awk -F: '{ print $1; }')
+        port=$(echo $serc | awk -F: '{ print $2; }')
+        intf=$(echo $serc | awk -F: '{ print $3; }')
+        brdg=$(echo $serc | awk -F: '{ print $4; }')
+        if [ -z "$slot" -o -z "$port" -o -z "$intf" -o -z "$brdg" ]; then
+            echo "Invalid serial config: $serc"
+            return 1
+        fi
+        echo "lxc.network.type = veth"  >>$path/config
+        echo "lxc.network.name = $intf" >>$path/config
+        echo "lxc.network.link = $brdg" >>$path/config
+        echo "lxc.network.flags = up"   >>$path/config
+        echo ""                         >>$path/config        
+    done
+
+    # generate dynamips base config file, part 1: static preamble
+    cat <<EOF > $rootfs/cisco/baseconfig.cfg
+!
+hostname $name
+!
+no ip domain lookup
+ip tcp synwait 5
+!
+EOF
+
+    # generate dynamips base config file, part 2: ethernet interfaces
+    for ((eth=0; eth < $numethers; eth++)) do
+        ethc=${ethers[$eth]}
+        slot=$(echo $ethc | awk -F: '{ print $1; }')
+        port=$(echo $ethc | awk -F: '{ print $2; }')
+        ifip=$(echo $ethc | awk -F: '{ print $5; }')
+        mask=$(echo $ethc | awk -F: '{ print $6; }')
+
+        echo "interface Ethernet${slot}/${port}"   >>$rootfs/cisco/baseconfig.cfg
+        if [ -n "${ifip}" -a -n "${mask}" ]; then
+            # IP addresses are optional
+            echo "  ip address ${ifip} ${mask}"    >>$rootfs/cisco/baseconfig.cfg
+        fi
+        echo "  full-duplex"                       >>$rootfs/cisco/baseconfig.cfg
+        echo "  no keepalive"                      >>$rootfs/cisco/baseconfig.cfg
+        echo "  no shutdown"                       >>$rootfs/cisco/baseconfig.cfg
+    done
+
+    # generate dynamips base config file, part 3: serial interfaces
+    for ((ser=0; ser < $numserials; ser++)) do
+        serc=${serials[$ser]}
+        slot=$(echo $serc | awk -F: '{ print $1; }')
+        port=$(echo $serc | awk -F: '{ print $2; }')
+        ifip=$(echo $serc | awk -F: '{ print $5; }')
+        mask=$(echo $serc | awk -F: '{ print $6; }')
+        echo "interface Serial${slot}/${port}"     >>$rootfs/cisco/baseconfig.cfg
+        if [ -n "${ifip}" -a -n "${mask}" ]; then
+            # IP addresses are optional
+            echo "  ip address ${ifip} ${mask}"    >>$rootfs/cisco/baseconfig.cfg
+        fi
+        echo "  serial restart-delay 0"            >>$rootfs/cisco/baseconfig.cfg
+        echo "  no keepalive"                      >>$rootfs/cisco/baseconfig.cfg
+        echo "  no shutdown"                       >>$rootfs/cisco/baseconfig.cfg
+    done
+
+    # generate dynamips base config file, part 4: static trailer (serial lines etc)
+    cat <<EOF >> $rootfs/cisco/baseconfig.cfg
+line con 0
+  exec-timeout 0 0
+  logging synchronous
+  privilege level 15
+  no login
+  length 0
+line aux 0
+  exec-timeout 0 0
+  logging synchronous
+  privilege level 15
+  no login
+  length 0
+!
+end
+EOF
+}
+
+usage()
+{
+    cat <<EOF
+$1 -h|--help -p|--path=<path> --ioscfg=<cfgname> --basepath=<path-to-basedir>
+    [--ether=slot:port:interface:bridge:ip:netmask]+
+    [--serial=slot:port:interface:bridge:ip:netmask]+
+EOF
+    return 0
+}
+
+options=$(getopt -o hp:n: -l help,rootfs:,path:,name:,basepath:,ioscfg:,ether:,serial: -- "$@")
+if [ $? -ne 0 ]; then
+    usage $(basename $0)
+    exit 1
+fi
+eval set -- "$options"
+
+while true
+do
+    case "$1" in
+        -h|--help)      usage $0 && exit 0;;
+        -p|--path)      path=$2; shift 2;;
+        --rootfs)       rootfs=$2; shift 2;;
+        --ioscfg)       ioscfg=$2; shift 2;;
+        --basepath)     basepath=$2; shift 2;;
+        --ether)        ethers[$numethers]=$2; numethers=$((numethers + 1)); shift 2;;
+        --serial)       serials[$numserials]=$2; numserials=$((numserials + 1)); shift 2;;
+        -n|--name)      name=$2; shift 2;;
+        --)             shift 1; break ;;
+        *)              break ;;
+    esac
+done
+
+if [ -z "${basepath}" ]; then
+    echo "The basepath value is required"
+    exit 1
+fi
+
+if [ -z "${ioscfg}" ]; then
+    echo "The ioscfg value is required"
+    exit 1
+fi
+
+if [ ! -f "${basepath}/ios/configs/${ioscfg}.conf" ]; then
+    echo "The config file ${basepath}/ios/configs/${ioscfg}.conf does not exist"
+    exit 1
+fi
+
+if [ $numethers -eq 0 ]; then
+    echo "Warning: No ethernet connections defined"
+fi
+
+for ((eth=0; eth < $numethers; eth++)) do
+  echo "Ethernet $eth: ${ethers[$eth]}"
+done
+
+for ((ser=0; ser < $numserials; ser++)) do
+  echo "Serial $ser: ${serials[$ser]}"
+done
+
+# parse IOS values
+. "${basepath}/ios/configs/${ioscfg}.conf"
+
+echo "Using IOS image ${ios_image}"
+
+if [ "$(id -u)" != "0" ]; then
+    echo "This script should be run as 'root'"
+    exit 1
+fi
+
+if [ -z "$path" ]; then
+    echo "'path' parameter is required"
+    exit 1
+fi
+
+
+# detect rootfs
+config="$path/config"
+if [ -z "$rootfs" ]; then
+    if grep -q '^lxc.rootfs' $config 2>/dev/null ; then
+        rootfs=$(awk -F= '/^lxc.rootfs =/{ print $2 }' $config)
+    else
+        rootfs=$path/rootfs
+    fi
+fi
+
+install_dynamips $rootfs $name
+if [ $? -ne 0 ]; then
+    echo "failed to install dynamips' rootfs"
+    exit 1
+fi
+
+configure_dynamips $rootfs
+if [ $? -ne 0 ]; then
+    echo "failed to configure dynamips template"
+    exit 1
+fi
+
+copy_configuration $path $rootfs $name
+if [ $? -ne 0 ]; then
+    echo "failed to write configuration file"
+    exit 1
+fi
+

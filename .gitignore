@@ -1,0 +1,6 @@
+**/*.dsk
+**/*.bin
+simh/bin/
+!simh/nvram/*.bin
+!simh/bin/README
+
