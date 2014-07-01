@@ -131,8 +131,9 @@ The machine config file should define these variables:
 Especially note the multi-line variable `simh_base_config` which is basically a rudimentary simh configuration file for that machine. Note that disks and ethernet will be defined later by the template, and finally a "boot cpu" line will also be added. The NVRAM should always be called nvram.bin as that is the name the lxc-scripts use to set everything up.
 
 The second config file depends on the OS you want to boot that machine with. Here's a short example:
-    # SimH OS config file
 
+    # SimH OS config file
+    
     # the NVRAM file to use from simh/nvram/    
     simh_nvram_file="nvram-vax-ultix40.bin"
     
